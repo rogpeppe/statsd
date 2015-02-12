@@ -78,3 +78,8 @@ func DecrementGauge(stat string, value int, rate float64) error {
 func Unique(stat string, value int, rate float64) error {
 	return current.Unique(stat, value, rate)
 }
+
+// Flush flushes writes any buffered data to the network.
+func Flush() error {
+	return current.Flush()
+}
