@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-func fakeClient(buffer *bytes.Buffer) *Client {
-	return &Client{
+func fakeClient(buffer *bytes.Buffer) *client {
+	return &client{
 		buf: bufio.NewWriterSize(buffer, defaultBufSize),
 	}
 }
