@@ -4,20 +4,19 @@ in-app metrics.
 
 Supports counting, sampling, timing, gauges, sets and multi-metrics packet.
 
-Using the client to increment a counter:
+Example usage:
 
-	client, err := statsd.Dial("127.0.0.1:8125")
+	err := statsd.SetAddr("127.0.0.1:8125")
 	if err != nil {
 		// handle error
 	}
-	defer client.Close()
-	err = client.Increment("buckets", 1, 1)
+	err = statsd.Increment("buckets", 1, 1)
 
 */
 package statsd
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"net"
@@ -67,55 +66,33 @@ type Client interface {
 }
 
 type client struct {
-	conn net.Conn
-	buf  *bufio.Writer
+	addr string
+	size int
+
 	m    sync.Mutex
+	buf  bytes.Buffer
+	conn net.Conn
 }
 
 func millisecond(d time.Duration) int {
 	return int(d.Seconds() * 1000)
 }
 
-// Dial connects to the given address on the given network using net.Dial and
-// then returns a new client for the connection.
-func Dial(addr string) (*client, error) {
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		return nil, err
+func newClient(addr string) (*client, error) {
+	c := &client{
+		addr: addr,
+		size: defaultBufSize,
 	}
-	return newClient(conn, 0), nil
+	return c, c.connect()
 }
 
-// DialTimeout acts like Dial but takes a timeout. The timeout includes name
-// resolution, if required.
-func DialTimeout(addr string, timeout time.Duration) (*client, error) {
-	conn, err := net.DialTimeout("udp", addr, timeout)
+func (c *client) connect() error {
+	conn, err := net.Dial("udp", c.addr)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return newClient(conn, 0), nil
-}
-
-// DialSize acts like Dial but takes a packet size. By default, the packet size
-// is 512, see
-// https://github.com/etsy/statsd/blob/master/docs/metric_types.md#multi-metric-packets
-// for guidelines.
-func DialSize(addr string, size int) (*client, error) {
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return newClient(conn, size), nil
-}
-
-func newClient(conn net.Conn, size int) *client {
-	if size <= 0 {
-		size = defaultBufSize
-	}
-	return &client{
-		conn: conn,
-		buf:  bufio.NewWriterSize(conn, size),
-	}
+	c.conn = conn
+	return nil
 }
 
 // Increment implements the Client interface.
@@ -167,7 +144,27 @@ func (c *client) Unique(stat string, value int, rate float64) error {
 
 // Flush implements the Client interface.
 func (c *client) Flush() error {
-	return c.buf.Flush()
+	defer c.buf.Reset()
+
+	if c.conn == nil {
+		err := c.connect()
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err := c.conn.Write(c.buf.Bytes())
+	if err != nil {
+		// Try to reconnect and retry
+		err = c.connect()
+		if err != nil {
+			return err
+		}
+		_, err = c.conn.Write(c.buf.Bytes())
+		return err
+	}
+
+	return nil
 }
 
 // Close implements the Client interface.
@@ -175,8 +172,10 @@ func (c *client) Close() error {
 	if err := c.Flush(); err != nil {
 		return err
 	}
-	c.buf = nil
-	return c.conn.Close()
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
 }
 
 func (c *client) send(stat string, rate float64, format string, args ...interface{}) error {
@@ -193,18 +192,27 @@ func (c *client) send(stat string, rate float64, format string, args ...interfac
 	c.m.Lock()
 	defer c.m.Unlock()
 
+	var err error
+
 	// Flush data if we have reach the buffer limit
-	if c.buf.Available() < len(format) {
-		if err := c.Flush(); err != nil {
-			return nil
+	if (c.size - c.buf.Len()) < len(format) {
+		err = c.Flush()
+		if err != nil {
+			return err
 		}
 	}
 
 	// Buffer is not empty, start filling it
-	if c.buf.Buffered() > 0 {
-		format = fmt.Sprintf("\n%s", format)
+	if c.buf.Len() > 0 {
+		_, err = fmt.Fprint(&c.buf, "\n")
+		if err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(&c.buf, format, args...)
+	if err != nil {
+		return err
 	}
 
-	_, err := fmt.Fprintf(c.buf, format, args...)
-	return err
+	return nil
 }

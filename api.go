@@ -25,7 +25,7 @@ func SetAddr(addr string) error {
 		log.Printf("error closing prior statsd connection: %v", err)
 	}
 
-	current, err = Dial(addr)
+	current, err = newClient(addr)
 	if err != nil {
 		log.Printf("error connecting to %q: %v", addr, err)
 		current = (*nilClient)(nil)

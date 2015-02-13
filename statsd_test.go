@@ -1,15 +1,39 @@
 package statsd
 
 import (
-	"bufio"
 	"bytes"
+	"io"
+	"net"
 	"testing"
 	"time"
 )
 
-func fakeClient(buffer *bytes.Buffer) *client {
-	return &client{
-		buf: bufio.NewWriterSize(buffer, defaultBufSize),
+type testClient struct {
+	client *client
+	buf    bytes.Buffer
+}
+
+func newTestClient(t *testing.T) *testClient {
+	r, w := net.Pipe()
+	tc := &testClient{
+		client: &client{
+			size: defaultBufSize,
+			conn: w,
+		},
+	}
+	go func() {
+		_, err := io.Copy(&tc.buf, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+	return tc
+}
+
+func (tc *testClient) assertClose(t *testing.T) {
+	err := tc.client.Close()
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -20,133 +44,119 @@ func assert(t *testing.T, value, control string) {
 }
 
 func TestIncrement(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Increment("incr", 1, 1)
+	tc := newTestClient(t)
+	err := tc.client.Increment("incr", 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "incr:1|c")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "incr:1|c")
 }
 
 func TestDecrement(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Decrement("decr", 1, 1)
+	tc := newTestClient(t)
+	err := tc.client.Decrement("decr", 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "decr:-1|c")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "decr:-1|c")
 }
 
 func TestDuration(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Duration("timing", time.Duration(123456789), 1)
+	tc := newTestClient(t)
+	err := tc.client.Duration("timing", time.Duration(123456789), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "timing:123|ms")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "timing:123|ms")
 }
 
 func TestIncrementRate(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Increment("incr", 1, 0.99)
+	tc := newTestClient(t)
+	err := tc.client.Increment("incr", 1, 0.99)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "incr:1|c|@0.99")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "incr:1|c|@0.99")
 }
 
 func TestPreciseRate(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
+	tc := newTestClient(t)
 	// The real use case here is rates like 0.0001.
-	err := c.Increment("incr", 1, 0.99901)
+	err := tc.client.Increment("incr", 1, 0.99901)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "incr:1|c|@0.99901")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "incr:1|c|@0.99901")
 }
 
 func TestRate(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Increment("incr", 1, 0)
+	tc := newTestClient(t)
+	err := tc.client.Increment("incr", 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "")
 }
 
 func TestGauge(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Gauge("gauge", 300, 1)
+	tc := newTestClient(t)
+	err := tc.client.Gauge("gauge", 300, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "gauge:300|g")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "gauge:300|g")
 }
 
 func TestIncrementGauge(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.IncrementGauge("gauge", 10, 1)
+	tc := newTestClient(t)
+	err := tc.client.IncrementGauge("gauge", 10, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "gauge:+10|g")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "gauge:+10|g")
 }
 
 func TestDecrementGauge(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.DecrementGauge("gauge", 4, 1)
+	tc := newTestClient(t)
+	err := tc.client.DecrementGauge("gauge", 4, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "gauge:-4|g")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "gauge:-4|g")
 }
 
 func TestUnique(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Unique("unique", 765, 1)
+	tc := newTestClient(t)
+	err := tc.client.Unique("unique", 765, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "unique:765|s")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "unique:765|s")
 }
 
 var millisecondTests = []struct {
 	duration time.Duration
 	control  int
-}{
-	{
-		duration: 350 * time.Millisecond,
-		control:  350,
-	},
-	{
-		duration: 5 * time.Second,
-		control:  5000,
-	},
-	{
-		duration: 50 * time.Nanosecond,
-		control:  0,
-	},
-}
+}{{
+	duration: 350 * time.Millisecond,
+	control:  350,
+}, {
+	duration: 5 * time.Second,
+	control:  5000,
+}, {
+	duration: 50 * time.Nanosecond,
+	control:  0,
+}}
 
 func TestMilliseconds(t *testing.T) {
 	for i, mt := range millisecondTests {
@@ -158,51 +168,47 @@ func TestMilliseconds(t *testing.T) {
 }
 
 func TestTiming(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Timing("timing", 350, 1)
+	tc := newTestClient(t)
+	err := tc.client.Timing("timing", 350, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "timing:350|ms")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "timing:350|ms")
 }
 
 func TestTime(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Time("time", 1, func() { time.Sleep(50e6) })
+	tc := newTestClient(t)
+	err := tc.client.Time("time", 1, func() { time.Sleep(50e6) })
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestMultiPacket(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
-	err := c.Unique("unique", 765, 1)
+	tc := newTestClient(t)
+	err := tc.client.Unique("unique", 765, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = c.Unique("unique", 765, 1)
+	err = tc.client.Unique("unique", 765, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Flush()
-	assert(t, buf.String(), "unique:765|s\nunique:765|s")
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "unique:765|s\nunique:765|s")
 }
 
 func TestMultiPacketOverflow(t *testing.T) {
-	buf := new(bytes.Buffer)
-	c := fakeClient(buf)
+	tc := newTestClient(t)
 	for i := 0; i < 40; i++ {
-		err := c.Unique("unique", 765, 1)
+		err := tc.client.Unique("unique", 765, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	assert(t, buf.String(), "unique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s")
-	buf.Reset()
-	c.Flush()
-	assert(t, buf.String(), "unique:765|s")
+	assert(t, tc.buf.String(), "unique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s\nunique:765|s")
+	tc.buf.Reset()
+	tc.assertClose(t)
+	assert(t, tc.buf.String(), "unique:765|s")
 }
