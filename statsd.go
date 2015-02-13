@@ -17,7 +17,9 @@ package statsd
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
 	"sync"
@@ -28,65 +30,51 @@ const (
 	defaultBufSize = 512
 )
 
-// Client is StatsD client that collects and sends in-app metrics.
-type Client interface {
-
-	// Increment increments the counter for the given bucket.
-	Increment(stat string, count int, rate float64) error
-
-	// Decrement decrements the counter for the given bucket.
-	Decrement(stat string, count int, rate float64) error
-
-	// Duration records time spent for the given bucket with time.Duration.
-	Duration(stat string, duration time.Duration, rate float64) error
-
-	// Timing records time spent for the given bucket in milliseconds.
-	Timing(stat string, delta int, rate float64) error
-
-	// Time calculates time spent in given function and send it.
-	Time(stat string, rate float64, f func()) error
-
-	// Gauge records arbitrary values for the given bucket.
-	Gauge(stat string, value int, rate float64) error
-
-	// IncrementGauge increments the value of the gauge.
-	IncrementGauge(stat string, value int, rate float64) error
-
-	// DecrementGauge decrements the value of the gauge.
-	DecrementGauge(stat string, value int, rate float64) error
-
-	// Unique records unique occurences of events.
-	Unique(stat string, value int, rate float64) error
-
-	// Flush flushes writes any buffered data to the network.
-	Flush() error
-
-	// Close closes the connection.
-	Close() error
-}
-
 type client struct {
-	addr string
 	size int
 
 	m    sync.Mutex
-	buf  bytes.Buffer
+	addr string
 	conn net.Conn
+	buf  bytes.Buffer
 }
 
 func millisecond(d time.Duration) int {
 	return int(d.Seconds() * 1000)
 }
 
-func newClient(addr string) (*client, error) {
-	c := &client{
-		addr: addr,
+func newClient() *client {
+	return &client{
 		size: defaultBufSize,
 	}
-	return c, c.connect()
 }
 
+// setAddr connects the client to a new address, to which stats will be sent.
+func (c *client) setAddr(addr string) error {
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	c.addr = addr
+	return c.connect()
+}
+
+// connect dials the currently configured address. Caller must hold the client
+// mutex lock. This method either returns an error, or sets the client
+// connection.
 func (c *client) connect() error {
+	var err error
+
+	if c.addr == "" {
+		return errors.New("address not set")
+	}
+
+	if c.conn != nil {
+		err = c.conn.Close()
+		if err != nil {
+			log.Printf("error closing prior client connection: %v", err)
+		}
+	}
+
 	conn, err := net.Dial("udp", c.addr)
 	if err != nil {
 		return err
@@ -95,55 +83,47 @@ func (c *client) connect() error {
 	return nil
 }
 
-// Increment implements the Client interface.
-func (c *client) Increment(stat string, count int, rate float64) error {
+func (c *client) increment(stat string, count int, rate float64) error {
 	return c.send(stat, rate, "%d|c", count)
 }
 
-// Decrement implements the Client interface.
-func (c *client) Decrement(stat string, count int, rate float64) error {
-	return c.Increment(stat, -count, rate)
+func (c *client) decrement(stat string, count int, rate float64) error {
+	return c.increment(stat, -count, rate)
 }
 
-// Duration implements the Client interface.
-func (c *client) Duration(stat string, duration time.Duration, rate float64) error {
+func (c *client) duration(stat string, duration time.Duration, rate float64) error {
 	return c.send(stat, rate, "%d|ms", millisecond(duration))
 }
 
-// Timing implements the Client interface.
-func (c *client) Timing(stat string, delta int, rate float64) error {
+func (c *client) timing(stat string, delta int, rate float64) error {
 	return c.send(stat, rate, "%d|ms", delta)
 }
 
-// Time implements the Client interface.
-func (c *client) Time(stat string, rate float64, f func()) error {
+func (c *client) time(stat string, rate float64, f func()) error {
 	ts := time.Now()
 	f()
-	return c.Duration(stat, time.Since(ts), rate)
+	return c.duration(stat, time.Since(ts), rate)
 }
 
-// Gauge implements the Client interface.
-func (c *client) Gauge(stat string, value int, rate float64) error {
+func (c *client) gauge(stat string, value int, rate float64) error {
 	return c.send(stat, rate, "%d|g", value)
 }
 
-// IncrementGauge implements the Client interface.
-func (c *client) IncrementGauge(stat string, value int, rate float64) error {
+func (c *client) incrementGauge(stat string, value int, rate float64) error {
 	return c.send(stat, rate, "+%d|g", value)
 }
 
-// DecrementGauge implements the Client interface.
-func (c *client) DecrementGauge(stat string, value int, rate float64) error {
+func (c *client) decrementGauge(stat string, value int, rate float64) error {
 	return c.send(stat, rate, "-%d|g", value)
 }
 
-// Unique implements the Client interface.
-func (c *client) Unique(stat string, value int, rate float64) error {
+func (c *client) unique(stat string, value int, rate float64) error {
 	return c.send(stat, rate, "%d|s", value)
 }
 
-// Flush implements the Client interface.
-func (c *client) Flush() error {
+// flush writes all buffered stats messages to the client connection. Caller
+// must hold the client mutex lock.
+func (c *client) flush() error {
 	defer c.buf.Reset()
 
 	if c.conn == nil {
@@ -167,17 +147,6 @@ func (c *client) Flush() error {
 	return nil
 }
 
-// Close implements the Client interface.
-func (c *client) Close() error {
-	if err := c.Flush(); err != nil {
-		return err
-	}
-	if c.conn != nil {
-		return c.conn.Close()
-	}
-	return nil
-}
-
 func (c *client) send(stat string, rate float64, format string, args ...interface{}) error {
 	if rate < 1 {
 		if rand.Float64() < rate {
@@ -196,7 +165,7 @@ func (c *client) send(stat string, rate float64, format string, args ...interfac
 
 	// Flush data if we have reach the buffer limit
 	if (c.size - c.buf.Len()) < len(format) {
-		err = c.Flush()
+		err = c.flush()
 		if err != nil {
 			return err
 		}
