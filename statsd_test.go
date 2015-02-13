@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
 
 type testClient struct {
 	client *client
+	wg     sync.WaitGroup
 	buf    bytes.Buffer
 }
 
@@ -22,6 +24,8 @@ func newTestClient(t *testing.T) *testClient {
 		},
 	}
 	go func() {
+		tc.wg.Add(1)
+		defer tc.wg.Done()
 		_, err := io.Copy(&tc.buf, r)
 		if err != nil {
 			t.Fatal(err)
@@ -30,11 +34,19 @@ func newTestClient(t *testing.T) *testClient {
 	return tc
 }
 
+func (tc *testClient) Close() error {
+	tc.client.m.Lock()
+	defer tc.client.m.Unlock()
+	defer tc.client.conn.Close()
+	return tc.client.flush()
+}
+
 func (tc *testClient) assertClose(t *testing.T) {
-	err := tc.client.Close()
+	err := tc.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
+	tc.wg.Wait()
 }
 
 func assert(t *testing.T, value, control string) {
@@ -45,7 +57,7 @@ func assert(t *testing.T, value, control string) {
 
 func TestIncrement(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Increment("incr", 1, 1)
+	err := tc.client.increment("incr", 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +67,7 @@ func TestIncrement(t *testing.T) {
 
 func TestDecrement(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Decrement("decr", 1, 1)
+	err := tc.client.decrement("decr", 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +77,7 @@ func TestDecrement(t *testing.T) {
 
 func TestDuration(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Duration("timing", time.Duration(123456789), 1)
+	err := tc.client.duration("timing", time.Duration(123456789), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +87,7 @@ func TestDuration(t *testing.T) {
 
 func TestIncrementRate(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Increment("incr", 1, 0.99)
+	err := tc.client.increment("incr", 1, 0.99)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +98,7 @@ func TestIncrementRate(t *testing.T) {
 func TestPreciseRate(t *testing.T) {
 	tc := newTestClient(t)
 	// The real use case here is rates like 0.0001.
-	err := tc.client.Increment("incr", 1, 0.99901)
+	err := tc.client.increment("incr", 1, 0.99901)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +108,7 @@ func TestPreciseRate(t *testing.T) {
 
 func TestRate(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Increment("incr", 1, 0)
+	err := tc.client.increment("incr", 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +118,7 @@ func TestRate(t *testing.T) {
 
 func TestGauge(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Gauge("gauge", 300, 1)
+	err := tc.client.gauge("gauge", 300, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +128,7 @@ func TestGauge(t *testing.T) {
 
 func TestIncrementGauge(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.IncrementGauge("gauge", 10, 1)
+	err := tc.client.incrementGauge("gauge", 10, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +138,7 @@ func TestIncrementGauge(t *testing.T) {
 
 func TestDecrementGauge(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.DecrementGauge("gauge", 4, 1)
+	err := tc.client.decrementGauge("gauge", 4, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +148,7 @@ func TestDecrementGauge(t *testing.T) {
 
 func TestUnique(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Unique("unique", 765, 1)
+	err := tc.client.unique("unique", 765, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +181,7 @@ func TestMilliseconds(t *testing.T) {
 
 func TestTiming(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Timing("timing", 350, 1)
+	err := tc.client.timing("timing", 350, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +191,7 @@ func TestTiming(t *testing.T) {
 
 func TestTime(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Time("time", 1, func() { time.Sleep(50e6) })
+	err := tc.client.time("time", 1, func() { time.Sleep(50e6) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,11 +199,11 @@ func TestTime(t *testing.T) {
 
 func TestMultiPacket(t *testing.T) {
 	tc := newTestClient(t)
-	err := tc.client.Unique("unique", 765, 1)
+	err := tc.client.unique("unique", 765, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = tc.client.Unique("unique", 765, 1)
+	err = tc.client.unique("unique", 765, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +214,7 @@ func TestMultiPacket(t *testing.T) {
 func TestMultiPacketOverflow(t *testing.T) {
 	tc := newTestClient(t)
 	for i := 0; i < 40; i++ {
-		err := tc.client.Unique("unique", 765, 1)
+		err := tc.client.unique("unique", 765, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
