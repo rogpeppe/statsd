@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"sync"
@@ -58,21 +57,19 @@ func (c *client) setAddr(addr string) error {
 	return c.connect()
 }
 
-// connect dials the currently configured address. Caller must hold the client
-// mutex lock. This method either returns an error, or sets the client
-// connection.
+// connect dials the currently configured address after closing any prior
+// connection held. Caller must hold the client mutex lock. This method either
+// returns an error or sets the client connection.
 func (c *client) connect() error {
 	var err error
 
-	if c.addr == "" {
-		return errors.New("address not set")
+	if c.conn != nil {
+		defer c.conn.Close()
+		c.conn = nil
 	}
 
-	if c.conn != nil {
-		err = c.conn.Close()
-		if err != nil {
-			log.Printf("error closing prior client connection: %v", err)
-		}
+	if c.addr == "" {
+		return errors.New("address not set")
 	}
 
 	conn, err := net.Dial("udp", c.addr)

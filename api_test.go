@@ -16,6 +16,18 @@ func assertUDPPort(t *testing.T, ln net.PacketConn) int {
 	return udpAddr.Port
 }
 
+func TestUnsetAddr(t *testing.T) {
+	c := newClient()
+	err := c.increment("foo", 100, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.flush()
+	if err == nil {
+		t.Fatal("connect error expected")
+	}
+}
+
 func TestSetAddr(t *testing.T) {
 	ln, err := net.ListenPacket("udp", ":0")
 	if err != nil {
@@ -71,6 +83,18 @@ func TestReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// No address set.
+	err = SetAddr("")
+	if err == nil {
+		t.Fatal("expected 'address not set' error")
+	}
+
+	// Metrics get dropped on the floor.
+	for i := 0; i < 1000; i++ {
+		Gauge("novelty", i, 1)
+	}
+	Flush()
 
 	// Try sending a bunch of stats with no server listening.
 	err = SetAddr(fmt.Sprintf("localhost:%d", port))
