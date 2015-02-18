@@ -2,7 +2,7 @@
 Package statsd is a StatsD-compatible client for collecting operational
 in-app metrics.
 
-Supports counting, sampling, timing, gauges, sets and multi-metrics packet.
+It supports counting, sampling, timing, gauges, sets and multi-metrics packet.
 
 Example usage:
 
@@ -12,15 +12,18 @@ Example usage:
 	}
 	err = statsd.Increment("buckets", 1, 1)
 
+Where there is a rate parameter, it should be a number between
+0 and 1 holding the probability of the event being logged.
+If it is one, the event will always be logged.
 */
 package statsd
 
 import (
-	"bytes"
 	"errors"
-	"fmt"
+	"io"
 	"math/rand"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -29,156 +32,219 @@ const (
 	defaultBufSize = 512
 )
 
-type client struct {
+// Client represents a statsd client.
+type Client struct {
 	size int
 
-	m    sync.Mutex
-	addr string
-	conn net.Conn
-	buf  bytes.Buffer
+	// mu guards the following fields.
+	mu        sync.Mutex
+	rand      *rand.Rand
+	conn      io.WriteCloser
+	buf       []byte
+	errorFunc func(error)
 }
 
-func millisecond(d time.Duration) int {
-	return int(d.Seconds() * 1000)
-}
-
-func newClient() *client {
-	return &client{
+// NewClient creates a new statsd client that
+// will send stats to the given UDP host and port.
+func NewClient(hostPort string) (*Client, error) {
+	c := &Client{
 		size: defaultBufSize,
+		rand: rand.New(rand.NewSource(0)),
 	}
+	if err := c.SetHostPort(hostPort); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
-// setAddr connects the client to a new address, to which stats will be sent.
-func (c *client) setAddr(addr string) error {
-	c.m.Lock()
-	defer c.m.Unlock()
-
-	c.addr = addr
-	return c.connect()
+// SetErrorFunc sets a function that will be called
+// when any error occurs when writing stats data.
+// The function should not block, and in particular
+// it must not operate on the same Client, as that
+// will cause a deadlock.
+//
+// If f is nil (the default for a new client), errors
+// will be ignored.
+func (c *Client) SetErrorFunc(f func(err error)) {
+	c.mu.Lock()
+	c.errorFunc = f
+	c.mu.Unlock()
 }
 
-// connect dials the currently configured address after closing any prior
-// connection held. Caller must hold the client mutex lock. This method either
-// returns an error or sets the client connection.
-func (c *client) connect() error {
-	var err error
-
-	if c.conn != nil {
-		defer c.conn.Close()
-		c.conn = nil
-	}
-
-	if c.addr == "" {
-		return errors.New("address not set")
-	}
-
-	conn, err := net.Dial("udp", c.addr)
+// SetHostPort sets the UDP addressto which stats
+// will be sent. If it returns an error, the address will
+// remain unchanged.
+func (c *Client) SetHostPort(addr string) error {
+	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		return err
+	}
+	c.mu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
 	}
 	c.conn = conn
+	c.mu.Unlock()
 	return nil
 }
 
-func (c *client) increment(stat string, count int, rate float64) error {
-	return c.send(stat, rate, "%d|c", count)
+// Increment causes the given counter statistic to be incremented
+// by the given delta. To decrement a counter, use a negative
+// delta.
+func (c *Client) Increment(stat string, delta int, rate float64) {
+	c.send(&metric{
+		kind: "c",
+		stat: stat,
+		rate: rate,
+		n:    delta,
+	})
 }
 
-func (c *client) decrement(stat string, count int, rate float64) error {
-	return c.increment(stat, -count, rate)
+// Duration records a duration value for the given statistic.
+// The duration is assumed to be non-negative
+// and is rounded to the nearest millisecond.
+func (c *Client) Duration(stat string, duration time.Duration, rate float64) {
+	c.send(&metric{
+		kind: "ms",
+		stat: stat,
+		rate: rate,
+		n:    int((duration + time.Millisecond/2) / time.Millisecond),
+	})
 }
 
-func (c *client) duration(stat string, duration time.Duration, rate float64) error {
-	return c.send(stat, rate, "%d|ms", millisecond(duration))
-}
-
-func (c *client) timing(stat string, delta int, rate float64) error {
-	return c.send(stat, rate, "%d|ms", delta)
-}
-
-func (c *client) time(stat string, rate float64, f func()) error {
+// TimeFunction calls f and records a duration value for
+// the given statistic recording the length of time it took
+// to run. The function will always be called even if the
+// rate is less than 1.
+func (c *Client) TimeFunction(stat string, rate float64, f func()) {
 	ts := time.Now()
 	f()
-	return c.duration(stat, time.Since(ts), rate)
+	c.Duration(stat, time.Since(ts), rate)
 }
 
-func (c *client) gauge(stat string, value int, rate float64) error {
-	return c.send(stat, rate, "%d|g", value)
+// Gauge records an absolute value for the given stat.
+func (c *Client) Gauge(stat string, value int) {
+	c.send(&metric{
+		kind: "g",
+		sign: signNone,
+		stat: stat,
+		rate: 1,
+		n:    value,
+	})
 }
 
-func (c *client) incrementGauge(stat string, value int, rate float64) error {
-	return c.send(stat, rate, "+%d|g", value)
+// IncrementGauge changes the value of the gauge
+// by the given delta. To decrement a gauge, use a negative
+// delta.
+func (c *Client) IncrementGauge(stat string, delta int) {
+	c.send(&metric{
+		kind: "g",
+		sign: signRequired,
+		stat: stat,
+		rate: 1,
+		n:    delta,
+	})
 }
 
-func (c *client) decrementGauge(stat string, value int, rate float64) error {
-	return c.send(stat, rate, "-%d|g", value)
+// Unique records that the given count of unique statevents
+// have occurred occurred.
+func (c *Client) Unique(stat string, count int) {
+	c.send(&metric{
+		kind: "s",
+		stat: stat,
+		n:    count,
+		rate: 1,
+	})
 }
 
-func (c *client) unique(stat string, value int, rate float64) error {
-	return c.send(stat, rate, "%d|s", value)
+// flush writes all buffered stats messages to the client connection.
+// The caller must hold the client mutex lock.
+func (c *Client) flush() {
+	if len(c.buf) == 0 {
+		return
+	}
+	_, err := c.conn.Write(c.buf)
+	c.buf = c.buf[:0]
+	if err != nil && c.errorFunc != nil {
+		c.errorFunc(err)
+	}
 }
 
-// flush writes all buffered stats messages to the client connection. Caller
-// must hold the client mutex lock.
-func (c *client) flush() error {
-	defer c.buf.Reset()
+// Flush flushes all buffered statistics.
+// TODO do this automatically after some
+// time has elapsed since the last statistic.
+func (c *Client) Flush() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flush()
+}
 
-	if c.conn == nil {
-		err := c.connect()
-		if err != nil {
-			return err
+type sign uint8
+
+const (
+	signMaybe sign = iota
+	signRequired
+	signNone
+)
+
+type metric struct {
+	stat string
+	sign sign
+	n    int
+	kind string
+	rate float64
+}
+
+var errTooBig = errors.New("metric too big")
+
+func (c *Client) send(m *metric) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if m.rate < 1 && c.rand.Float64() >= m.rate {
+		return
+	}
+	oldLen := len(c.buf)
+	buf := m.append(c.buf)
+	if len(buf) <= c.size {
+		c.buf = buf
+		return
+	}
+	if oldLen == 0 {
+		if c.errorFunc != nil {
+			c.errorFunc(errTooBig)
 		}
+		return
 	}
-
-	_, err := c.conn.Write(c.buf.Bytes())
-	if err != nil {
-		// Try to reconnect and retry
-		err = c.connect()
-		if err != nil {
-			return err
-		}
-		_, err = c.conn.Write(c.buf.Bytes())
-		return err
-	}
-
-	return nil
+	c.flush()
+	// Copy the recently appended data to the start
+	// of the buffer, omitting the initial newline.
+	c.buf = append(c.buf, buf[oldLen+1:]...)
 }
 
-func (c *client) send(stat string, rate float64, format string, args ...interface{}) error {
-	if rate < 1 {
-		if rand.Float64() < rate {
-			format = fmt.Sprintf("%s|@%g", format, rate)
-		} else {
-			return nil
-		}
+// append appends the metric data to the given
+// buffer and returns the new buffer.
+func (m *metric) append(buf []byte) []byte {
+	if len(buf) > 0 {
+		buf = append(buf, '\n')
 	}
-
-	format = fmt.Sprintf("%s:%s", stat, format)
-
-	c.m.Lock()
-	defer c.m.Unlock()
-
-	var err error
-
-	// Flush data if we have reach the buffer limit
-	if (c.size - c.buf.Len()) < len(format) {
-		err = c.flush()
-		if err != nil {
-			return err
-		}
+	if m.sign == signNone && m.n < 0 {
+		// We're trying to send a negative absolute value
+		// for a gauge. We can't do that without resetting
+		// the value first.
+		buf = append(buf, m.stat...)
+		buf = append(buf, ":0|g\n"...)
 	}
-
-	// Buffer is not empty, start filling it
-	if c.buf.Len() > 0 {
-		_, err = fmt.Fprint(&c.buf, "\n")
-		if err != nil {
-			return err
-		}
+	buf = append(buf, m.stat...)
+	buf = append(buf, ':')
+	if m.sign == signRequired && m.n >= 0 {
+		buf = append(buf, '+')
 	}
-	_, err = fmt.Fprintf(&c.buf, format, args...)
-	if err != nil {
-		return err
+	buf = strconv.AppendInt(buf, int64(m.n), 10)
+	buf = append(buf, '|')
+	buf = append(buf, m.kind...)
+	if m.rate < 1 {
+		buf = append(buf, '|', '@')
+		buf = strconv.AppendFloat(buf, m.rate, 'f', -1, 64)
 	}
-
-	return nil
+	return buf
 }
